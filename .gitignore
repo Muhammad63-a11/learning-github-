@@ -1,0 +1,4 @@
+.doctor_workspace/
+output/
+__pycache__/
+*.pyc
