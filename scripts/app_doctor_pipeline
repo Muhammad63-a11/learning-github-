@@ -1,0 +1,1006 @@
+
+# ---------------- Detailed Human + Technical Diagnostics ----------------
+# This layer is intentionally deterministic: it translates common Expo/Android
+# failures into an explanation a non-technical user can understand while
+# preserving technical evidence for developers.
+
+ERROR_RULES = [
+    {
+        "name": "Node.js / Expo SDK incompatibility",
+        "patterns": [r"Unsupported engine", r"EBADENGINE", r"node.*version", r"requires a peer of.*node"],
+        "stage": "Expo dependency setup",
+        "human": "Your project requires a different Node.js version from the one currently being used. Expo and its packages can refuse to install or run when the Node version is outside their supported range.",
+        "action": "The Doctor will determine the project's required Node version, switch to a compatible runtime when possible, reinstall dependencies, and retry.",
+        "confidence": 0.96,
+    },
+    {
+        "name": "JavaScript dependency conflict",
+        "patterns": [r"ERESOLVE", r"peer dep", r"peer dependency", r"Could not resolve dependency"],
+        "stage": "JavaScript dependency installation",
+        "human": "Two or more JavaScript packages in your Expo project are asking for incompatible versions of a dependency. The package manager cannot create a dependency tree that satisfies all of them.",
+        "action": "The Doctor will inspect the dependency tree and lockfile, identify the packages causing the conflict, and attempt a safe compatible resolution before rebuilding.",
+        "confidence": 0.94,
+    },
+    {
+        "name": "Expo configuration / config-plugin failure",
+        "patterns": [r"expo prebuild", r"config plugin", r"plugin.*error", r"with.*plugin", r"app\.config"],
+        "stage": "Expo prebuild",
+        "human": "Expo could not turn your Expo configuration into the native Android project. This usually means an Expo config plugin, app configuration value, or native configuration step is incompatible or malformed.",
+        "action": "The Doctor will inspect app.json/app.config.*, Expo plugins, and the prebuild output, then attempt a safe configuration repair and regenerate the Android project.",
+        "confidence": 0.90,
+    },
+    {
+        "name": "Android SDK component missing",
+        "patterns": [r"failed to find target", r"SDK location", r"platforms;android-", r"build-tools.*not found", r"licenses.*not accepted"],
+        "stage": "Android environment / Gradle",
+        "human": "The Android build environment is missing an Android SDK component required by your project. This is a machine setup problem rather than necessarily a problem in your app.",
+        "action": "The Doctor will identify the requested Android API/build-tools version, install the required SDK component when available, accept required licenses, and retry.",
+        "confidence": 0.98,
+    },
+    {
+        "name": "Java / JDK compatibility",
+        "patterns": [r"Unsupported class file major version", r"JAVA_HOME", r"JDK", r"java.*version", r"invalid source release", r"invalid target release"],
+        "stage": "Android environment / Gradle",
+        "human": "The Android build is using a Java version that does not match what the Expo/React Native/Gradle toolchain expects. Android compilation therefore stopped before the APK could be produced.",
+        "action": "The Doctor will detect the required Java/Gradle combination, configure a compatible JDK where possible, and rebuild.",
+        "confidence": 0.95,
+    },
+    {
+        "name": "Gradle memory / resource failure",
+        "patterns": [r"Java heap space", r"OutOfMemoryError", r"GC overhead", r"daemon.*memory"],
+        "stage": "Android compilation",
+        "human": "The Android compiler ran out of available memory while building your app. The project may be valid; the build machine simply did not have enough memory configured for Gradle.",
+        "action": "The Doctor will adjust Gradle memory settings within safe limits, clean the affected build state, and retry.",
+        "confidence": 0.97,
+    },
+    {
+        "name": "Android resource / manifest failure",
+        "patterns": [r"mergeDebugResources", r"processDebugResources", r"Android resource linking failed", r"Manifest merger failed"],
+        "stage": "Android resource packaging",
+        "human": "Android could not combine or package one or more resources or manifest entries required by the generated application. This can come from a native module, Expo config plugin, or conflicting Android configuration.",
+        "action": "The Doctor will inspect the exact resource/manifest error and the generated Android configuration before attempting a targeted repair.",
+        "confidence": 0.93,
+    },
+    {
+        "name": "Kotlin / native module compilation failure",
+        "patterns": [r"Kotlin.*failed", r"compile.*Kotlin", r"Unresolved reference", r"compileDebugKotlin", r"compileReleaseKotlin"],
+        "stage": "Native Android compilation",
+        "human": "A native Android module used by the Expo project could not be compiled. This is commonly caused by a package version that is incompatible with the current Expo/React Native/Android toolchain.",
+        "action": "The Doctor will identify the failing native module and version information, check compatibility signals, and attempt a safe dependency/configuration repair.",
+        "confidence": 0.91,
+    },
+    {
+        "name": "Network / package registry failure",
+        "patterns": [r"ETIMEDOUT", r"ECONNRESET", r"ENOTFOUND", r"network", r"fetch failed", r"Could not GET"],
+        "stage": "Dependency download",
+        "human": "The builder could not download a package or Gradle dependency. This is usually a temporary network, registry, or remote-server problem rather than an error in your app.",
+        "action": "The Doctor will retry downloads with the configured package manager/Gradle caches before treating the project itself as broken.",
+        "confidence": 0.88,
+    },
+    {
+        "name": "APK packaging / validation failure",
+        "patterns": [r"apksigner", r"BadZipFile", r"not a zip", r"INSTALL_PARSE_FAILED", r"parse.*package"],
+        "stage": "APK validation",
+        "human": "A file was produced with an APK-like name, but the resulting package did not pass Android APK integrity checks. The Doctor will not report this as a successful build just because Gradle returned success.",
+        "action": "The Doctor will locate the real APK artifact, verify its ZIP/APK structure, manifest, DEX files, and signature, and reject invalid artifacts.",
+        "confidence": 0.99,
+    },
+]
+
+def diagnose_for_humans(log_text: str):
+    import re as _re
+    text = log_text or ""
+    low = text.lower()
+    matches = []
+    for rule in ERROR_RULES:
+        score = sum(1 for pat in rule["patterns"] if _re.search(pat, text, _re.I))
+        if score:
+            matches.append((score, rule))
+    matches.sort(key=lambda x: x[0], reverse=True)
+    if not matches:
+        return {
+            "category": "Unclassified build failure",
+            "stage": "Build pipeline",
+            "human": "The build stopped, but the available log did not match one of the Doctor's known failure patterns. The original technical error should be reviewed before making changes.",
+            "action": "Preserve the original log, inspect the final error block, and avoid destructive automatic changes when the cause is uncertain.",
+            "confidence": 0.55,
+        }
+    return matches[0][1]
+
+def format_dual_diagnosis(log_text: str, attempt: int = 0):
+    d = diagnose_for_humans(log_text)
+    technical_tail = "\n".join((log_text or "").splitlines()[-80:])
+    return f"""
+============================================================
+AI APP DOCTOR — HUMAN + TECHNICAL DIAGNOSIS
+============================================================
+Attempt: {attempt}
+Category: {d['name']}
+Stage: {d['stage']}
+Diagnosis confidence: {d['confidence']:.0%}
+
+WHAT HAPPENED (PLAIN ENGLISH)
+{d['human']}
+
+WHY IT HAPPENED
+The Doctor classified the failure using the build output and matched
+it against known Expo/React Native/Android failure signatures. The
+classification is a diagnosis, not a claim that every matching message
+is necessarily the root cause.
+
+WHAT THE DOCTOR WILL DO
+{d['action']}
+
+TECHNICAL DIAGNOSIS
+Category: {d['name']}
+Stage: {d['stage']}
+Confidence: {d['confidence']:.0%}
+
+ORIGINAL TECHNICAL EVIDENCE (LAST LOG LINES)
+------------------------------------------------------------
+{technical_tail}
+============================================================
+"""
+
+
+#!/usr/bin/env python3
+"""
+AI App Doctor Pro — Expo/React Native APK Builder for GitHub Actions.
+
+Pipeline:
+  ZIP -> safe extraction -> Expo project detection -> static examination ->
+  diagnosis -> Node/package-manager setup -> Expo prebuild (when needed) ->
+  Android toolchain -> real Gradle build -> deterministic repair/retry loop ->
+  APK validation -> PDF report.
+
+This intentionally does NOT rewrite arbitrary TypeScript/JavaScript source.
+Automatic repairs are limited to environment, dependency installation,
+Expo prebuild, Gradle/Android toolchain, cache and packaging problems.
+"""
+
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+
+MAX_ATTEMPTS = 12
+COMMAND_TIMEOUT = 1500
+MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILES = 60000
+
+REPO_ROOT = Path(os.environ.get("GITHUB_WORKSPACE", os.getcwd())).resolve()
+INPUT_DIR = REPO_ROOT / "input"
+BASE_DIR = REPO_ROOT / ".doctor_workspace"
+WORK_DIR = BASE_DIR / "work"
+BACKUP_DIR = BASE_DIR / "backup"
+TOOLS_DIR = BASE_DIR / "tools"
+OUTPUT_DIR = REPO_ROOT / "output"
+SDK_ROOT = BASE_DIR / "android-sdk"
+
+for d in (WORK_DIR, BACKUP_DIR, TOOLS_DIR, OUTPUT_DIR, SDK_ROOT):
+    d.mkdir(parents=True, exist_ok=True)
+
+IGNORE_DIRS = {".git", ".gradle", "build", "node_modules", ".idea", ".expo", ".turbo", ".cache"}
+RUN_LOG = []
+FINDINGS = []
+DIAGNOSES = []
+REPAIRS = []
+BUILD_ATTEMPTS = []
+PROJECT = None
+PACKAGE_JSON = None
+EXPO_VERSION = None
+NODE_REQUIRED = None
+PACKAGE_MANAGER = None
+APK_PATH = None
+APK_META = {}
+STATIC_SCORE = 0
+
+
+def log(msg=""):
+    print(str(msg), flush=True)
+    RUN_LOG.append(str(msg))
+
+
+def run_capture(cmd, cwd=None, timeout=COMMAND_TIMEOUT, check=False, env=None):
+    if isinstance(cmd, list):
+        printable = " ".join(subprocess.list2cmdline([str(x)]) for x in cmd)
+        shell = False
+    else:
+        printable = cmd
+        shell = True
+    log(f"\n$ {printable}")
+    try:
+        p = subprocess.run(
+            cmd, cwd=str(cwd) if cwd else None, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, env=env, shell=shell
+        )
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "")
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        out = out[-20000:]
+        log(out)
+        if check:
+            raise RuntimeError(f"Command timed out after {timeout}s: {printable}")
+        return 124, out
+    out = p.stdout or ""
+    log(out[-20000:])
+    if check and p.returncode != 0:
+        raise RuntimeError(f"Command failed ({p.returncode}): {printable}")
+    return p.returncode, out
+
+
+def finding(check, status, detail, penalty=0, evidence=None):
+    item = {"check": check, "status": status, "detail": detail, "penalty": penalty}
+    if evidence is not None:
+        item["evidence"] = evidence
+    FINDINGS.append(item)
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def rel(path, root=PROJECT):
+    return str(Path(path).resolve().relative_to(Path(root).resolve()))
+
+
+def input_zip():
+    url = os.environ.get("ZIP_URL") or ""
+    if url:
+        target = INPUT_DIR / "project.zip"
+        run_capture(["curl", "--fail", "--location", "--retry", "3",
+                     "--retry-all-errors", url, "-o", str(target)], timeout=600, check=True)
+        return target
+    files = sorted(INPUT_DIR.glob("*.zip"))
+    if len(files) != 1:
+        raise RuntimeError("Expected exactly one ZIP in input/ when ZIP_URL is not supplied.")
+    return files[0]
+
+
+def safe_extract(zpath, destination):
+    destination.mkdir(parents=True, exist_ok=True)
+    total = 0
+    count = 0
+    with zipfile.ZipFile(zpath) as z:
+        bad = z.testzip()
+        if bad:
+            raise RuntimeError(f"ZIP CRC test failed at: {bad}")
+        for info in z.infolist():
+            count += 1
+            if count > MAX_FILES:
+                raise RuntimeError("ZIP contains too many files.")
+            total += info.file_size
+            if total > MAX_UNCOMPRESSED_BYTES:
+                raise RuntimeError("ZIP exceeds the uncompressed-size safety limit.")
+            name = info.filename.replace("\\", "/")
+            if name.startswith("/") or re.match(r"^[A-Za-z]:/", name) or ".." in Path(name).parts:
+                raise RuntimeError(f"Unsafe ZIP path rejected: {name}")
+            out = (destination / name).resolve()
+            if destination.resolve() not in out.parents and out != destination.resolve():
+                raise RuntimeError(f"ZIP path escapes extraction directory: {name}")
+        z.extractall(destination)
+
+
+def find_project_root(root):
+    candidates = []
+    for p in root.rglob("package.json"):
+        if any(part in IGNORE_DIRS for part in p.parts):
+            continue
+        try:
+            data = json.loads(read_text(p))
+        except Exception:
+            continue
+        deps = {}
+        deps.update(data.get("dependencies") or {})
+        deps.update(data.get("devDependencies") or {})
+        score = 0
+        if "expo" in deps:
+            score += 100
+        if (p.parent / "app.json").exists() or (p.parent / "app.config.js").exists() or (p.parent / "app.config.ts").exists():
+            score += 20
+        if (p.parent / "android").is_dir():
+            score += 20
+        candidates.append((score, -len(p.parts), p.parent, p, data))
+    if not candidates:
+        raise RuntimeError("No package.json was found. This does not look like an Expo project.")
+    candidates.sort(reverse=True, key=lambda x: (x[0], x[1]))
+    best = candidates[0]
+    if best[0] < 100:
+        raise RuntimeError("package.json found, but Expo was not detected in dependencies.")
+    return best[2], best[3], best[4]
+
+
+def detect_package_manager(project, pkg):
+    if (project / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (project / "yarn.lock").exists():
+        return "yarn"
+    if (project / "package-lock.json").exists():
+        return "npm"
+    pm = str(pkg.get("packageManager") or "")
+    if pm.startswith("pnpm@"):
+        return "pnpm"
+    if pm.startswith("yarn@"):
+        return "yarn"
+    return "npm"
+
+
+def parse_expo_version(pkg):
+    deps = {}
+    deps.update(pkg.get("dependencies") or {})
+    deps.update(pkg.get("devDependencies") or {})
+    value = str(deps.get("expo") or "")
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
+    if m:
+        return tuple(map(int, m.groups()))
+    m = re.search(r"(\d+)", value)
+    return (int(m.group(1)), 0, 0) if m else None
+
+
+def parse_node_requirement(pkg):
+    engines = pkg.get("engines") or {}
+    value = str(engines.get("node") or "")
+    if value:
+        m = re.search(r"(?:>=|~|\\^|>|=)?\\s*(\d+)", value)
+        if m:
+            return int(m.group(1))
+    nvm = PROJECT / ".nvmrc"
+    if nvm.exists():
+        m = re.search(r"(\d+)", read_text(nvm))
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def static_examination():
+    global STATIC_SCORE
+    FINDINGS.clear()
+    pkg = PACKAGE_JSON
+    expo = parse_expo_version(pkg)
+    root_files = {
+        "package.json": PACKAGE_JSON.exists(),
+        "app.json": (PROJECT / "app.json").exists(),
+        "app.config.js": (PROJECT / "app.config.js").exists(),
+        "app.config.ts": (PROJECT / "app.config.ts").exists(),
+        "android/": (PROJECT / "android").is_dir(),
+    }
+
+    if root_files["package.json"]:
+        finding("package.json", "PASS", "Expo project package.json detected.")
+    else:
+        finding("package.json", "FAIL", "package.json is missing.", 18)
+
+    if expo:
+        finding("Expo dependency", "PASS", f"Expo version reference detected: {expo[0]}.{expo[1]}.{expo[2]}.",
+                evidence={"version": ".".join(map(str, expo))})
+    else:
+        finding("Expo dependency", "FAIL", "Expo dependency version could not be resolved.", 18)
+
+    configs = [k for k in ("app.json", "app.config.js", "app.config.ts") if root_files[k]]
+    finding("Expo configuration", "PASS" if configs else "WARN",
+            f"Configuration file(s): {', '.join(configs) if configs else 'none'}",
+            0 if configs else 6)
+
+    lock = {"npm": "package-lock.json", "yarn": "yarn.lock", "pnpm": "pnpm-lock.yaml"}[PACKAGE_MANAGER]
+    finding("Package manager lockfile", "PASS" if (PROJECT / lock).exists() else "WARN",
+            f"{PACKAGE_MANAGER} selected; {'lockfile present' if (PROJECT / lock).exists() else 'no lockfile found; install will use package.json'}",
+            0 if (PROJECT / lock).exists() else 4)
+
+    if root_files["android/"]:
+        gradlew = (PROJECT / "android/gradlew")
+        finding("Native Android project", "PASS", "android/ exists; existing native project will be preserved.")
+        finding("Gradle wrapper", "PASS" if gradlew.exists() else "WARN",
+                "android/gradlew found." if gradlew.exists() else "android/gradlew missing.",
+                0 if gradlew.exists() else 8)
+    else:
+        finding("Native Android project", "INFO",
+                "android/ is absent; Expo prebuild will generate the Android project.")
+
+    node_req = parse_node_requirement(pkg)
+    finding("Node.js requirement", "INFO",
+            str(node_req) if node_req else "Not declared; workflow starts with Node 20.",
+            evidence={"major": node_req})
+
+    # Native files and obvious secret patterns
+    native_count = 0
+    secret_hits = []
+    scan_ext = {".js", ".jsx", ".ts", ".tsx", ".json", ".env", ".xml", ".gradle", ".kts", ".properties"}
+    secret_patterns = [
+        ("Google API key", r"AIza[0-9A-Za-z_-]{20,}", 94),
+        ("OpenAI-style secret", r"sk-[A-Za-z0-9_-]{20,}", 90),
+        ("GitHub token", r"gh[pousr]_[A-Za-z0-9_]{20,}", 96),
+        ("Generic API key assignment", r"(?i)(?:api[_-]?key|apikey)\s*[:=]\s*[\"'][^\"']{12,}[\"']", 72),
+        ("Bearer token", r"(?i)Bearer\s+[A-Za-z0-9._-]{20,}", 78),
+    ]
+    placeholders = ("your_", "your-", "xxxx", "example", "placeholder", "dummy", "changeme", "replace_me")
+    for dp, dns, fns in os.walk(PROJECT):
+        dns[:] = [d for d in dns if d not in IGNORE_DIRS]
+        for fn in fns:
+            p = Path(dp) / fn
+            if p.suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".java", ".kt"}:
+                native_count += 1
+            if p.suffix.lower() not in scan_ext or p.stat().st_size > 2_000_000:
+                continue
+            txt = read_text(p)
+            for label, pat, conf in secret_patterns:
+                for m in re.finditer(pat, txt):
+                    raw = m.group(0)
+                    if any(x in raw.lower() for x in placeholders):
+                        continue
+                    secret_hits.append({"file": rel(p), "line": txt[:m.start()].count("\n")+1,
+                                        "type": label, "confidence": conf})
+    finding("Source inventory", "PASS", f"{native_count} JS/TS/native source file(s) inspected.")
+    if secret_hits:
+        finding("Secret scan", "WARN", f"{len(secret_hits)} credential-like value(s) detected. Review before publishing.",
+                8, secret_hits[:20])
+    else:
+        finding("Secret scan", "PASS", "No high-confidence credential-like patterns found.")
+
+    STATIC_SCORE = max(0, min(100, 100 - sum(x["penalty"] for x in FINDINGS)))
+    log("\n" + "=" * 88)
+    log(f"STATIC HEALTH: {STATIC_SCORE}/100")
+    for f in FINDINGS:
+        log(f"[{f['status']}] {f['check']}: {f['detail']}")
+    return STATIC_SCORE
+
+
+def diagnose():
+    DIAGNOSES.clear()
+    if not (PROJECT / "android").exists():
+        DIAGNOSES.append({
+            "title": "Managed Expo project requires native generation",
+            "severity": "Info",
+            "cause": "No android/ directory exists.",
+            "treatment": "Run Expo prebuild for Android before Gradle compilation.",
+            "auto": True
+        })
+    if PACKAGE_MANAGER == "npm" and not (PROJECT / "package-lock.json").exists():
+        DIAGNOSES.append({
+            "title": "No npm lockfile",
+            "severity": "Low",
+            "cause": "Dependencies are not pinned by package-lock.json.",
+            "treatment": "Install from package.json and continue; reproducibility is lower.",
+            "auto": True
+        })
+    if any(f["check"] == "Secret scan" and f["status"] == "WARN" for f in FINDINGS):
+        DIAGNOSES.append({
+            "title": "Potential credential exposure",
+            "severity": "Medium",
+            "cause": "A credential-like value was found in project files.",
+            "treatment": "Review and rotate real credentials. Doctor does not silently delete secrets.",
+            "auto": False
+        })
+    if not DIAGNOSES:
+        DIAGNOSES.append({
+            "title": "No static blocker detected",
+            "severity": "Low",
+            "cause": "Project structure looks suitable for an Expo Android build.",
+            "treatment": "Proceed to dependency installation, prebuild if needed, and real Gradle compilation.",
+            "auto": True
+        })
+
+
+def apt_install(*packages):
+    run_capture("sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq", timeout=600, check=True)
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    run_capture(["sudo", "apt-get", "install", "-y", "-qq", *packages],
+                timeout=900, check=True, env=env)
+
+
+def ensure_jdk(major=17):
+    candidates = [
+        f"/usr/lib/jvm/java-{major}-openjdk-amd64",
+        f"/usr/lib/jvm/java-{major}-openjdk",
+        f"/usr/lib/jvm/temurin-{major}-jdk-amd64",
+    ]
+    for c in candidates:
+        if Path(c).is_dir():
+            os.environ["JAVA_HOME"] = c
+            os.environ["PATH"] = f"{c}/bin:" + ":".join(
+                x for x in os.environ.get("PATH", "").split(":") if "/jvm/" not in x
+            )
+            return c
+    apt_install(f"openjdk-{major}-jdk")
+    for c in candidates:
+        if Path(c).is_dir():
+            os.environ["JAVA_HOME"] = c
+            os.environ["PATH"] = f"{c}/bin:" + os.environ["PATH"]
+            return c
+    raise RuntimeError(f"Could not locate OpenJDK {major}.")
+
+
+def setup_android_sdk():
+    os.environ["ANDROID_SDK_ROOT"] = str(SDK_ROOT)
+    os.environ["ANDROID_HOME"] = str(SDK_ROOT)
+    apt_install("wget", "unzip", "zip", "curl")
+
+    sdkmanager = SDK_ROOT / "cmdline-tools/latest/bin/sdkmanager"
+    if not sdkmanager.exists():
+        tmp = TOOLS_DIR / "cmdline-tools.zip"
+        url = "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip"
+        run_capture(["wget", "-q", "-O", str(tmp), url], timeout=900, check=True)
+        extract = TOOLS_DIR / "cmdline-extract"
+        shutil.rmtree(extract, ignore_errors=True)
+        extract.mkdir(parents=True)
+        run_capture(["unzip", "-q", str(tmp), "-d", str(extract)], check=True)
+        sdkmanager.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(extract / "cmdline-tools", sdkmanager.parent.parent, dirs_exist_ok=True)
+
+    os.environ["PATH"] = (
+        f"{SDK_ROOT}/platform-tools:{SDK_ROOT}/cmdline-tools/latest/bin:"
+        f"{os.environ.get('JAVA_HOME','')}/bin:" + os.environ.get("PATH", "")
+    )
+    sdkmanager = str(sdkmanager)
+    run_capture(f"yes | '{sdkmanager}' --licenses >/dev/null 2>&1 || true", timeout=300)
+    # Broad baseline. Missing versions discovered by Gradle are installed on demand.
+    for pkg in ("platform-tools", "platforms;android-35", "platforms;android-36",
+                "build-tools;35.0.0", "build-tools;36.0.0"):
+        run_capture([sdkmanager, pkg], timeout=1200, check=False)
+    return sdkmanager
+
+
+def install_sdk_from_error(text):
+    found = set()
+    for m in re.finditer(r"(?:platforms;android-|android-)(\d{2})", text):
+        found.add(m.group(1))
+    for m in re.finditer(r"build-tools[;/: ]+([0-9]+\.[0-9]+\.[0-9]+)", text, re.I):
+        found.add("BT:" + m.group(1))
+    sdkmanager = str(SDK_ROOT / "cmdline-tools/latest/bin/sdkmanager")
+    changed = False
+    for v in sorted(found):
+        if v.startswith("BT:"):
+            run_capture([sdkmanager, "build-tools;" + v[3:]], timeout=1200, check=False)
+        else:
+            run_capture([sdkmanager, "platforms;android-" + v], timeout=1200, check=False)
+        changed = True
+    return changed
+
+
+def npm_install():
+    env = os.environ.copy()
+    env["CI"] = "1"
+    if PACKAGE_MANAGER == "npm":
+        if (PROJECT / "package-lock.json").exists():
+            return run_capture(["npm", "ci", "--no-audit", "--no-fund"], cwd=PROJECT, timeout=1200, env=env)
+        return run_capture(["npm", "install", "--no-audit", "--no-fund"], cwd=PROJECT, timeout=1200, env=env)
+    if PACKAGE_MANAGER == "yarn":
+        run_capture(["corepack", "enable"], timeout=120)
+        if (PROJECT / "yarn.lock").exists():
+            return run_capture(["yarn", "install", "--immutable"], cwd=PROJECT, timeout=1200, env=env)
+        return run_capture(["yarn", "install"], cwd=PROJECT, timeout=1200, env=env)
+    run_capture(["corepack", "enable"], timeout=120)
+    if (PROJECT / "pnpm-lock.yaml").exists():
+        return run_capture(["pnpm", "install", "--frozen-lockfile"], cwd=PROJECT, timeout=1200, env=env)
+    return run_capture(["pnpm", "install"], cwd=PROJECT, timeout=1200, env=env)
+
+
+def expo_cli(args, timeout=1200):
+    env = os.environ.copy()
+    env.update({"CI": "1", "EXPO_NO_TELEMETRY": "1"})
+    # npx uses the project's local Expo binary when dependencies are installed.
+    return run_capture(["npx", "--no-install", "expo", *args], cwd=PROJECT, timeout=timeout, env=env)
+
+
+def prebuild_if_needed():
+    if (PROJECT / "android").is_dir():
+        return 0, "Existing android/ preserved; prebuild not required."
+    rc, out = expo_cli(["prebuild", "--platform", "android", "--no-install"], timeout=1500)
+    if rc != 0:
+        # A second attempt without --no-install can recover projects whose
+        # Expo version expects dependency installation during prebuild.
+        rc, out2 = expo_cli(["prebuild", "--platform", "android"], timeout=1500)
+        out += "\n" + out2
+    return rc, out
+
+
+def gradle_cmd():
+    gradlew = PROJECT / "android/gradlew"
+    if not gradlew.exists():
+        raise RuntimeError("Expo prebuild/native project did not produce android/gradlew.")
+    try:
+        gradlew.chmod(gradlew.stat().st_mode | 0o111)
+    except Exception:
+        pass
+    return ["bash", str(gradlew), "assembleDebug", "--stacktrace", "--no-daemon", "--console=plain"]
+
+
+def run_gradle(extra=None):
+    env = os.environ.copy()
+    env.update({
+        "CI": "1",
+        "EXPO_NO_TELEMETRY": "1",
+        "GRADLE_OPTS": os.environ.get("GRADLE_OPTS", "-Xmx4g -Dfile.encoding=UTF-8"),
+        "ANDROID_SDK_ROOT": str(SDK_ROOT),
+        "ANDROID_HOME": str(SDK_ROOT),
+    })
+    cmd = gradle_cmd()
+    if extra:
+        cmd.extend(extra)
+    return run_capture(cmd, cwd=PROJECT / "android", timeout=COMMAND_TIMEOUT, env=env)
+
+
+def classify_failure(text):
+    t = text.lower()
+    if "unsupported class file major version" in t or "invalid source release" in t or "requires java" in t or "jvm" in t and "version" in t:
+        return "java"
+    if "failed to install the following android sdk packages" in t or "android sdk" in t and "not found" in t or "compile sdk" in t and "not found" in t:
+        return "sdk"
+    if "outofmemoryerror" in t or "java heap space" in t or "gc overhead limit exceeded" in t:
+        return "memory"
+    if "could not resolve" in t or "could not get resource" in t or "connection reset" in t or "timed out" in t or "502 bad gateway" in t:
+        return "network"
+    if "duplicate class" in t or "manifest merger failed" in t:
+        return "dependency-conflict"
+    if "expo" in t and ("config plugin" in t or "pluginerror" in t):
+        return "expo-config"
+    if "unable to resolve module" in t or "module not found" in t:
+        return "js-dependency"
+    if "permission denied" in t and "gradlew" in t:
+        return "wrapper-permission"
+    return "source-or-native"
+
+
+def repair_for(kind, text, attempt):
+    changes = []
+
+    if kind == "sdk":
+        if install_sdk_from_error(text):
+            changes.append("installed Android SDK/build-tools versions reported by Gradle")
+    elif kind == "java":
+        # Expo's current Android toolchains generally use Java 17. Keep this
+        # deterministic rather than guessing arbitrary Java versions.
+        try:
+            ensure_jdk(17)
+            changes.append("re-activated OpenJDK 17")
+        except Exception as e:
+            log(f"JDK repair failed: {e}")
+    elif kind == "memory":
+        p = PROJECT / "android/gradle.properties"
+        old = read_text(p)
+        line = "org.gradle.jvmargs=-Xmx6g -Dfile.encoding=UTF-8"
+        if "org.gradle.jvmargs=" in old:
+            new = re.sub(r"(?m)^org\.gradle\.jvmargs=.*$", line, old)
+        else:
+            new = old.rstrip() + "\n" + line + "\n"
+        p.write_text(new, encoding="utf-8")
+        changes.append("raised Gradle heap to 6 GB")
+    elif kind == "network":
+        changes.append("retrying dependency resolution with Gradle refresh")
+    elif kind == "wrapper-permission":
+        p = PROJECT / "android/gradlew"
+        if p.exists():
+            p.chmod(p.stat().st_mode | 0o111)
+            changes.append("restored executable permission on android/gradlew")
+    elif kind == "js-dependency":
+        rc, _ = npm_install()
+        if rc == 0:
+            changes.append("reinstalled JavaScript dependencies")
+    elif kind == "dependency-conflict":
+        # Never edit arbitrary dependency versions. Re-run Expo Doctor to
+        # expose the real compatibility issue; source/config conflicts remain
+        # a human-review case.
+        rc, _ = expo_cli(["doctor"], timeout=900)
+        changes.append("ran Expo Doctor for compatibility diagnostics")
+    elif kind == "expo-config":
+        # Safe retry only: do not mutate config plugins automatically.
+        rc, _ = expo_cli(["doctor"], timeout=900)
+        changes.append("ran Expo Doctor; Expo config/plugin issue requires review if it persists")
+    return changes
+
+
+def build_loop():
+    last_output = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        log("\n" + "=" * 88)
+        log(f"BUILD ATTEMPT {attempt}/{MAX_ATTEMPTS}")
+        log("=" * 88)
+
+        if not (PROJECT / "node_modules").exists():
+            npm_install()
+
+        if not (PROJECT / "android").exists():
+            rc, out = prebuild_if_needed()
+            if rc != 0:
+                kind = classify_failure(out)
+                changes = repair_for(kind, out, attempt)
+                REPAIRS.append({"attempt": attempt, "failure": kind, "changes": changes})
+                BUILD_ATTEMPTS.append({"attempt": attempt, "stage": "prebuild", "status": "failed", "type": kind})
+                last_output = out
+                if kind in ("expo-config", "source-or-native") and not changes:
+                    break
+                continue
+
+        # Ensure SDK packages exposed by the newly generated native project are present.
+        if (PROJECT / "android").exists():
+            rc, out = run_gradle(["--version"])
+            if rc != 0:
+                kind = classify_failure(out)
+                changes = repair_for(kind, out, attempt)
+                REPAIRS.append({"attempt": attempt, "failure": kind, "changes": changes})
+                continue
+
+        extra = []
+        if attempt > 1:
+            extra = ["--refresh-dependencies"]
+        rc, out = run_gradle(extra)
+        BUILD_ATTEMPTS.append({
+            "attempt": attempt,
+            "stage": "gradle",
+            "status": "success" if rc == 0 else "failed",
+            "type": "success" if rc == 0 else classify_failure(out)
+        })
+        last_output = out
+        if rc == 0:
+            return True, out
+
+        kind = classify_failure(out)
+        changes = repair_for(kind, out, attempt)
+        REPAIRS.append({"attempt": attempt, "failure": kind, "changes": changes})
+        if kind == "source-or-native" and not changes:
+            log("Failure appears to require source/native code changes; stopping rather than guessing.")
+            break
+        time.sleep(min(10, attempt * 2))
+    return False, last_output
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def locate_apk():
+    candidates = []
+    for p in PROJECT.rglob("*.apk"):
+        if any(part in IGNORE_DIRS for part in p.parts):
+            continue
+        if "debug" in p.name.lower() or "outputs" in p.parts:
+            candidates.append(p)
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def validate_apk(apk):
+    if not apk or not apk.exists():
+        return False, "No APK produced."
+    checks = []
+    try:
+        with zipfile.ZipFile(apk) as z:
+            bad = z.testzip()
+            names = z.namelist()
+            checks.append(("ZIP integrity", bad is None, "OK" if bad is None else str(bad)))
+            has_manifest = "AndroidManifest.xml" in names
+            has_dex = any(n.startswith("classes") and n.endswith(".dex") for n in names)
+            checks.append(("AndroidManifest.xml", has_manifest, "present" if has_manifest else "missing"))
+            checks.append(("DEX", has_dex, "present" if has_dex else "missing"))
+            if bad or not has_manifest or not has_dex:
+                return False, "; ".join(f"{a}: {c}" for a,b,c in checks)
+    except Exception as e:
+        return False, f"APK ZIP validation failed: {e}"
+
+    build_tools = sorted(SDK_ROOT.glob("build-tools/*"), key=lambda p: p.name, reverse=True)
+    aapt2 = next((p / "aapt2" for p in build_tools if (p / "aapt2").exists()), None)
+    apksigner = next((p / "apksigner" for p in build_tools if (p / "apksigner").exists()), None)
+
+    if aapt2:
+        rc, out = run_capture([str(aapt2), "dump", "badging", str(apk)], timeout=120)
+        if rc == 0:
+            m = re.search(r"package: name='([^']+)' versionCode='([^']*)' versionName='([^']*)'", out)
+            if m:
+                APK_META.update({"package": m.group(1), "versionCode": m.group(2), "versionName": m.group(3)})
+            checks.append(("aapt2 manifest decode", True, "package metadata decoded"))
+        else:
+            checks.append(("aapt2 manifest decode", False, "aapt2 could not decode manifest"))
+            return False, "; ".join(f"{a}: {c}" for a,b,c in checks)
+    else:
+        return False, "No aapt2 available for manifest validation."
+
+    if apksigner:
+        rc, out = run_capture([str(apksigner), "verify", "--verbose", str(apk)], timeout=120)
+        ok = rc == 0
+        checks.append(("APK signature", ok, "verified" if ok else out[-2000:]))
+        if not ok:
+            return False, "; ".join(f"{a}: {c}" for a,b,c in checks)
+    else:
+        return False, "No apksigner available for signature validation."
+
+    digest = sha256_file(apk)
+    APK_META["sha256"] = digest
+    APK_META["size_bytes"] = apk.stat().st_size
+    checks.append(("SHA-256", True, digest))
+    return True, "; ".join(f"{a}: {c}" for a,b,c in checks)
+
+
+def package_apk(apk):
+    if not apk:
+        return None
+    name = APK_META.get("package") or "expo-app"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+    out = OUTPUT_DIR / f"{safe}-debug-validated.apk"
+    shutil.copy2(apk, out)
+    return out
+
+
+def write_pdf(success, validation_text):
+    pdf = OUTPUT_DIR / "app_doctor_expo_report.pdf"
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Small", parent=styles["BodyText"], fontSize=8, leading=10))
+    doc = SimpleDocTemplate(str(pdf), pagesize=A4, rightMargin=14*mm, leftMargin=14*mm,
+                            topMargin=14*mm, bottomMargin=14*mm)
+    story = []
+    story += [Paragraph("AI App Doctor Pro — Expo APK Report", styles["Title"]),
+              Paragraph(f"Final result: <b>{'SUCCESS' if success else 'FAILED'}</b>", styles["Heading2"]),
+              Paragraph(f"Project: {PROJECT.name if PROJECT else 'unknown'}", styles["BodyText"]),
+              Spacer(1, 6)]
+    story += [Paragraph(f"Static health score: <b>{STATIC_SCORE}/100</b>", styles["Heading2"])]
+    data = [["Check", "Status", "Detail"]]
+    for f in FINDINGS:
+        data.append([f["check"], f["status"], f["detail"][:500]])
+    table = Table(data, colWidths=[42*mm, 22*mm, 116*mm], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("FONTSIZE", (0,0), (-1,-1), 7),
+        ("LEADING", (0,0), (-1,-1), 9),
+    ]))
+    story += [table, Spacer(1, 8), Paragraph("Diagnosis", styles["Heading2"])]
+    for d in DIAGNOSES:
+        story.append(Paragraph(
+            f"<b>{d['title']}</b> [{d['severity']}]<br/>Cause: {d['cause']}<br/>Treatment: {d['treatment']}",
+            styles["Small"]))
+        story.append(Spacer(1, 4))
+
+    story.append(PageBreak())
+    story.append(Paragraph("Repair / build history", styles["Heading2"]))
+    for r in REPAIRS:
+        story.append(Paragraph(
+            f"Attempt {r['attempt']}: {r['failure']} — " +
+            (", ".join(r["changes"]) if r["changes"] else "no safe automatic repair"),
+            styles["Small"]))
+    for a in BUILD_ATTEMPTS:
+        story.append(Paragraph(f"Build attempt {a['attempt']}: {a['status']} ({a['type']})", styles["Small"]))
+
+    story += [Spacer(1, 8), Paragraph("APK validation", styles["Heading2"]),
+              Paragraph(validation_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
+                        styles["Small"])]
+    if APK_META:
+        story.append(Paragraph(
+            f"Package: {APK_META.get('package','unknown')}<br/>"
+            f"Size: {APK_META.get('size_bytes','unknown')} bytes<br/>"
+            f"SHA-256: {APK_META.get('sha256','unknown')}", styles["Small"]))
+
+    story += [Spacer(1, 8), Paragraph("Execution log tail", styles["Heading2"])]
+    tail = "\n".join(RUN_LOG)[-18000:]
+    for chunk in [tail[i:i+5000] for i in range(0, len(tail), 5000)]:
+        safe = (chunk.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\n", "<br/>"))
+        story.append(Paragraph(safe, styles["Small"]))
+    doc.build(story)
+    return pdf
+
+
+def main():
+    global PROJECT, PACKAGE_JSON, EXPO_VERSION, NODE_REQUIRED, PACKAGE_MANAGER, APK_PATH
+
+    # Preserve committed input ZIPs; workflow only wipes output/workspace.
+    zpath = input_zip()
+    log(f"Input ZIP: {zpath}")
+
+    shutil.rmtree(WORK_DIR, ignore_errors=True)
+    WORK_DIR.mkdir(parents=True)
+    shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+    OUTPUT_DIR.mkdir(parents=True)
+    shutil.rmtree(BACKUP_DIR, ignore_errors=True)
+    BACKUP_DIR.mkdir(parents=True)
+
+    extract_dir = WORK_DIR / "extracted"
+    safe_extract(zpath, extract_dir)
+    PROJECT, PACKAGE_JSON, pkg = find_project_root(extract_dir)
+    EXPO_VERSION = parse_expo_version(pkg)
+    NODE_REQUIRED = parse_node_requirement(pkg)
+    PACKAGE_MANAGER = detect_package_manager(PROJECT, pkg)
+
+    log(f"Detected Expo project root: {PROJECT}")
+    log(f"Expo version: {EXPO_VERSION}")
+    log(f"Package manager: {PACKAGE_MANAGER}")
+    log(f"Node requirement: {NODE_REQUIRED or '20/default'}")
+
+    shutil.copytree(PROJECT, BACKUP_DIR / "original", dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(*IGNORE_DIRS))
+
+    static_examination()
+    diagnose()
+
+    try:
+        ensure_jdk(17)
+        setup_android_sdk()
+    except Exception as e:
+        log(f"Toolchain setup error: {e}")
+        write_pdf(False, str(e))
+        return 1
+
+    rc, out = npm_install()
+    if rc != 0:
+        kind = classify_failure(out)
+        changes = repair_for(kind, out, 0)
+        REPAIRS.append({"attempt": 0, "failure": kind, "changes": changes})
+        if not changes:
+            write_pdf(False, "JavaScript dependency installation failed and no safe repair was available.")
+            return 1
+        rc, out = npm_install()
+        if rc != 0:
+            write_pdf(False, "JavaScript dependency installation failed after repair/retry.")
+            return 1
+
+    # Prebuild once before entering the Gradle retry loop.
+    if not (PROJECT / "android").exists():
+        rc, prebuild_out = prebuild_if_needed()
+        if rc != 0:
+            kind = classify_failure(prebuild_out)
+            changes = repair_for(kind, prebuild_out, 0)
+            REPAIRS.append({"attempt": 0, "failure": "prebuild-" + kind, "changes": changes})
+            if changes:
+                rc, prebuild_out = prebuild_if_needed()
+            if rc != 0:
+                write_pdf(False, "Expo prebuild failed. " + classify_failure(prebuild_out))
+                return 1
+
+    success, build_out = build_loop()
+    APK_PATH = locate_apk()
+    if success and APK_PATH:
+        valid, validation_text = validate_apk(APK_PATH)
+        if valid:
+            final = package_apk(APK_PATH)
+            log(f"Validated APK: {final}")
+            write_pdf(True, validation_text)
+            return 0
+        write_pdf(False, validation_text)
+        return 1
+
+    write_pdf(False, "Gradle did not produce a successful validated APK.\n" + build_out[-10000:])
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        log("FATAL: " + repr(exc))
+        try:
+            write_pdf(False, "Fatal internal error: " + repr(exc))
+        except Exception:
+            pass
+        sys.exit(1)
+
+
+def write_detailed_diagnostic(log_text, output_file, attempt=0):
+    """Write a dual-language diagnosis: human explanation + technical evidence."""
+    from pathlib import Path as _Path
+    _Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    _Path(output_file).write_text(
+        format_dual_diagnosis(log_text, attempt),
+        encoding="utf-8",
+    )
+
