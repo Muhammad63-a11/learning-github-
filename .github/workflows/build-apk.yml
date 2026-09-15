@@ -1,0 +1,107 @@
+
+# Expo-first build contract:
+# 1) Detect package.json/app.json/app.config.*
+# 2) Install dependencies using the project's package manager
+# 3) Run Expo prebuild when native Android output is absent
+# 4) Build the Expo-generated Android project with its Gradle wrapper
+# 5) On failure, collect detailed human + technical diagnosis
+# 6) Apply only bounded/safe environment/config repairs
+# 7) Rebuild and validate the actual APK artifact
+
+name: AI App Doctor Expo APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "Direct download URL of the Expo project ZIP"
+        required: false
+        type: string
+      callback_url:
+        description: "Optional backend webhook URL"
+        required: false
+        type: string
+  push:
+    paths:
+      - "input/**"
+      - ".github/workflows/build-apk.yml"
+      - "scripts/**"
+
+concurrency:
+  group: ai-app-doctor-expo-apk-builder
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Examine, diagnose, repair, build and validate Expo APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install Python requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download Expo project ZIP
+        env:
+          ZIP_URL: ${{ github.event.inputs.zip_url }}
+        run: |
+          set -e
+          rm -rf output
+          mkdir -p output input
+          if [ -n "$ZIP_URL" ]; then
+            rm -f input/*.zip
+            curl --fail --location --retry 3 --retry-all-errors "$ZIP_URL" -o input/project.zip
+          else
+            shopt -s nullglob
+            files=(input/*.zip)
+            if [ "${#files[@]}" -ne 1 ]; then
+              echo "::error::Provide zip_url or put exactly one ZIP in input/."
+              exit 1
+            fi
+          fi
+          test -s input/project.zip || { echo "::error::ZIP is empty."; exit 1; }
+          unzip -t input/project.zip >/dev/null
+          echo "Expo ZIP verified."
+
+      - name: Run AI App Doctor Expo pipeline
+        id: doctor
+        run: python scripts/app_doctor_pipeline.py
+
+      - name: Upload validated APK + PDF report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-app-doctor-expo-validated-output
+          path: |
+            output/*.apk
+            output/*.pdf
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Notify backend
+        if: always()
+        env:
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -n "$CALLBACK_URL" ]; then
+            status="failed"
+            if compgen -G "output/*-debug-validated.apk" > /dev/null; then status="success"; fi
+            curl --fail-with-body --max-time 30 -X POST "$CALLBACK_URL"               -H "Content-Type: application/json"               -d "{"run_id":"$RUN_ID","status":"$status"}" || true
+          fi
